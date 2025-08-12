@@ -1,5 +1,6 @@
 // Polyfill XMLHttpRequest for 'dav' in Node (Vercel functions)
-import { XMLHttpRequest as XHR2 } from 'xhr2';
+import xhr2pkg from 'xhr2';
+const { XMLHttpRequest: XHR2 } = xhr2pkg;
 globalThis.XMLHttpRequest = XHR2;
 
 import dayjs from 'dayjs';
