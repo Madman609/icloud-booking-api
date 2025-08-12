@@ -76,9 +76,9 @@ export default async function handler(req, res) {
     }
 
     // Fetch objects for the whole span from both calendars
-    const timeRange = {
-      start: startD.toDate(),
-      end: endD.add(1, 'day').toDate(),
+   const startISO = startD.toDate().toISOString();
+   const endISO = endD.add(1, 'day').toDate().toISOString();
+   const timeRange = { start: startISO, end: endISO };
     };
 
     const [bookingObjs, blackoutObjs] = await Promise.all([
