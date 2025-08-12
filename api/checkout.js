@@ -56,7 +56,7 @@ export default async function handler(req) {
     }
 
     const body = await req.json().catch(() => ({}));
-    const { date, summary, note, total, payMethod } = body || {};
+    const { date, summary, note, total /*, payMethod*/ } = body || {};
 
     if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
       return corsJSON(req, { error: 'Invalid or missing date' }, 400);
@@ -67,24 +67,33 @@ export default async function handler(req) {
       return corsJSON(req, { error: 'Invalid total amount' }, 400);
     }
 
-    // Re-check capacity (calls your availability route)
-    const r = await fetch(`${API_BASE}/api/availability?start=${date}&end=${date}`, { cache: 'no-store' });
-    const avail = await r.json().catch(() => ({}));
+    // Re-check capacity (server-side)
+    const availRes = await fetch(`${API_BASE}/api/availability?start=${date}&end=${date}`, { cache: 'no-store' });
+    const avail = await availRes.json().catch(() => ({}));
     const day = avail?.days?.[0];
 
+    // Helpful logging (visible in Vercel function logs)
+    console.log('[checkout] recheck', { date, avail });
+
     if (!day || day.blackout || day.bookedCount >= 2) {
-      return corsJSON(req, { error: 'Selected date is not available' }, 409);
+      return corsJSON(req, {
+        error: 'Selected date is not available',
+        detail: {
+          reason: !day ? 'no-day' : (day.blackout ? 'blackout' : (day.bookedCount >= 2 ? 'capacity' : 'unknown')),
+          day,
+          checkedAt: new Date().toISOString()
+        }
+      }, 409);
     }
 
     if (!STRIPE_KEY) {
       return corsJSON(req, { error: 'STRIPE_SECRET_KEY not configured' }, 500);
     }
 
-    // Stripe Checkout session via HTTPS fetch (Edge-compatible)
-    // Apple/Google Pay are covered by 'card'
+    // Stripe Checkout session
     const methods = ['card', 'link', 'cashapp'];
 
-    // You can point these to your website if preferred:
+    // You can change these to your website if you prefer:
     const successUrl = `${API_BASE}/success?date=${encodeURIComponent(date)}`;
     const cancelUrl = `${API_BASE}/cancel?date=${encodeURIComponent(date)}`;
 
@@ -104,14 +113,10 @@ export default async function handler(req) {
       'metadata[summary]': summary || '',
       'metadata[note]': note || '',
       'metadata[apiBase]': API_BASE,
-      // Let Checkout create/attach a customer and collect email
       customer_creation: 'always',
       billing_address_collection: 'auto',
       allow_promotion_codes: 'false',
     });
-
-    // Optionally pass customer_email if you’ve collected it on your page:
-    // form.set('customer_email', body.email || '');
 
     const createRes = await fetch('https://api.stripe.com/v1/checkout/sessions', {
       method: 'POST',
