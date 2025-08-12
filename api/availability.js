@@ -1,14 +1,7 @@
-// Polyfills for 'dav' on Node (Vercel functions)
-import xhr2pkg from 'xhr2';
-const { XMLHttpRequest } = xhr2pkg;
-globalThis.XMLHttpRequest = XMLHttpRequest;
-
-import { DOMParser as XmldomParser } from '@xmldom/xmldom';
-globalThis.DOMParser = XmldomParser;
-
+import 'cross-fetch/polyfill';
 import dayjs from 'dayjs';
-import * as dav from 'dav';
 import * as ICAL from 'ical.js';
+import { createDAVClient } from 'tsdav';
 
 const {
   ICLOUD_USERNAME,
@@ -17,55 +10,31 @@ const {
   BLACKOUTS_CAL_NAME = 'Blackouts',
 } = process.env;
 
-// CORS (tighten origin later to https://609music.com)
 function cors(res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Origin', '*'); // tighten to https://609music.com later
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 }
-
-function missingEnv() {
-  const m = [];
-  if (!ICLOUD_USERNAME) m.push('ICLOUD_USERNAME');
-  if (!ICLOUD_APP_PASSWORD) m.push('ICLOUD_APP_PASSWORD');
-  if (m.length) throw new Error('Missing env vars: ' + m.join(', '));
-}
-
-async function getAccount() {
-  missingEnv();
-  const xhr = new dav.transport.Basic(
-    new dav.Credentials({ username: ICLOUD_USERNAME, password: ICLOUD_APP_PASSWORD })
-  );
-  const account = await dav.createAccount({
-    server: 'https://caldav.icloud.com',
-    xhr,
-    loadCollections: true,
-    loadObjects: true,
-  });
-  return { account, xhr };
-}
-
-function findCalendar(account, displayName) {
-  return account.calendars.find(
-    c => (c.displayName || '').toLowerCase() === (displayName || '').toLowerCase()
-  );
-}
+const requireEnv = () => {
+  if (!ICLOUD_USERNAME || !ICLOUD_APP_PASSWORD) {
+    throw new Error('Missing ICLOUD_USERNAME or ICLOUD_APP_PASSWORD');
+  }
+};
 
 function countEventsOnDate(objects, date) {
-  const target = new Date(date.getFullYear(), date.getMonth(), date.getDate());
-  const next = new Date(target); next.setDate(next.getDate() + 1);
+  const startDay = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  const nextDay = new Date(startDay); nextDay.setDate(nextDay.getDate() + 1);
   let count = 0;
-  for (const obj of (objects || [])) {
-    if (!obj.calendarData) continue;
+  for (const obj of objects || []) {
     try {
-      const jcal = ICAL.parse(obj.calendarData);
+      const jcal = ICAL.parse(obj.data);
       const comp = new ICAL.Component(jcal);
-      const vevents = comp.getAllSubcomponents('vevent');
-      for (const v of vevents) {
-        const event = new ICAL.Event(v);
-        const start = event.startDate.toJSDate();
-        const end = event.endDate.toJSDate();
-        if (start < next && end > target) { count += 1; break; }
+      const events = comp.getAllSubcomponents('vevent');
+      for (const v of events) {
+        const evt = new ICAL.Event(v);
+        const s = evt.startDate.toJSDate();
+        const e = evt.endDate.toJSDate();
+        if (s < nextDay && e > startDay) { count++; break; }
       }
     } catch {}
   }
@@ -77,23 +46,52 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(204).end();
 
   try {
+    requireEnv();
     const { start, end } = req.query;
     if (!start) return res.status(400).json({ error: 'start required' });
-
     const startD = dayjs(start).startOf('day');
     const endD = dayjs(end || start).startOf('day');
     if (!startD.isValid() || !endD.isValid()) return res.status(400).json({ error: 'invalid dates' });
 
-    const { account } = await getAccount();
-    const calB = findCalendar(account, BOOKINGS_CAL_NAME);
-    const calX = findCalendar(account, BLACKOUTS_CAL_NAME);
-    if (!calB || !calX) return res.status(500).json({ error: 'Calendars not found' });
+    const client = await createDAVClient({
+      serverUrl: 'https://caldav.icloud.com',
+      credentials: {
+        username: ICLOUD_USERNAME,
+        password: ICLOUD_APP_PASSWORD,
+      },
+      authMethod: 'Basic',
+      defaultAccountType: 'caldav',
+    });
+
+    const calendars = await client.fetchCalendars();
+    if (!Array.isArray(calendars) || calendars.length === 0) {
+      return res.status(500).json({ error: 'No calendars found' });
+    }
+    const findCal = (name) =>
+      calendars.find(c => (c.displayName || '').toLowerCase() === name.toLowerCase());
+
+    const calBookings = findCal(BOOKINGS_CAL_NAME);
+    const calBlackouts = findCal(BLACKOUTS_CAL_NAME);
+    if (!calBookings || !calBlackouts) {
+      return res.status(500).json({ error: 'Calendars not found', names: calendars.map(c => c.displayName) });
+    }
+
+    // Fetch objects for the whole span from both calendars
+    const timeRange = {
+      start: startD.toDate(),
+      end: endD.add(1, 'day').toDate(),
+    };
+
+    const [bookingObjs, blackoutObjs] = await Promise.all([
+      client.fetchCalendarObjects({ calendar: calBookings, timeRange }),
+      client.fetchCalendarObjects({ calendar: calBlackouts, timeRange }),
+    ]);
 
     const days = [];
     for (let d = startD; d.isBefore(endD.add(1, 'day')); d = d.add(1, 'day')) {
       const js = d.toDate();
-      const booked = countEventsOnDate(calB.objects, js);
-      const blackout = countEventsOnDate(calX.objects, js) > 0;
+      const booked = countEventsOnDate(bookingObjs, js);
+      const blackout = countEventsOnDate(blackoutObjs, js) > 0;
       days.push({
         date: d.format('YYYY-MM-DD'),
         available: !blackout && booked <= 1,
@@ -107,6 +105,6 @@ export default async function handler(req, res) {
     return res.status(200).json({ days });
   } catch (e) {
     console.error(e);
-    return res.status(500).json({ error: 'availability failed' });
+    return res.status(500).json({ error: 'availability failed', detail: String(e?.message || e) });
   }
 }
