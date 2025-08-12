@@ -1,0 +1,12 @@
+{
+  "name": "icloud-vercel-api",
+  "version": "1.0.1",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "dav": "^1.8.0",
+    "dayjs": "^1.11.11",
+    "ical.js": "^2.0.0",
+    "xhr2": "^0.2.1"
+  }
+}
