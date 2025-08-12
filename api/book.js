@@ -72,7 +72,10 @@ export default async function handler(req, res) {
     }
 
     // Check capacity and blackouts for that day
-    const timeRange = { start: d.toDate(), end: d.add(1, 'day').toDate() };
+    const timeRange = {
+       start: d.toDate().toISOString(),
+       end: d.add(1, 'day').toDate().toISOString(),
+    };
     const [bookingObjs, blackoutObjs] = await Promise.all([
       client.fetchCalendarObjects({ calendar: calBookings, timeRange }),
       client.fetchCalendarObjects({ calendar: calBlackouts, timeRange }),
