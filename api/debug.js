@@ -1,4 +1,3 @@
-import 'cross-fetch/polyfill';
 import { createDAVClient } from 'tsdav';
 
 export default async function handler(req, res) {
