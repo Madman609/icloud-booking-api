@@ -1,4 +1,3 @@
-import 'cross-fetch/polyfill';
 import dayjs from 'dayjs';
 import * as ICAL from 'ical.js';
 import { createDAVClient } from 'tsdav';
