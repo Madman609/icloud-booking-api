@@ -1,4 +1,6 @@
 // api/book.js
+// NOTE: omit the old 'nodejs18.x' runtime. Either leave config out entirely,
+// or use { runtime: 'nodejs' } if you prefer explicit.
 export const config = { runtime: 'nodejs' };
 
 import dayjs from 'dayjs';
