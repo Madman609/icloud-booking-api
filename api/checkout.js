@@ -132,9 +132,6 @@ export default async function handler(req) {
 
     const form = new URLSearchParams({
       mode: 'payment',
-      'payment_method_types[]': methods[0],
-      'payment_method_types[]': methods[1],
-      'payment_method_types[]': methods[2],
       success_url: successUrl,
       cancel_url: cancelUrl,
       'line_items[0][price_data][currency]': 'usd',
