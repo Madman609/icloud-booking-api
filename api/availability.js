@@ -21,7 +21,6 @@ function needEnv() {
   }
 }
 
-// Pull ICS text out of various shapes tsdav/iCloud might return
 function pickICS(obj) {
   if (!obj) return null;
   if (typeof obj.data === 'string') return obj.data;
@@ -30,41 +29,41 @@ function pickICS(obj) {
     if (typeof obj.props['calendar-data'] === 'string') return obj.props['calendar-data'];
     if (typeof obj.props['calendardata'] === 'string') return obj.props['calendardata'];
   }
-  // Some providers put it under .objectData?.calendarData
   if (obj.objectData && typeof obj.objectData.calendarData === 'string') {
     return obj.objectData.calendarData;
   }
   return null;
 }
 
-// Fetch ICS for any objects that didn't include it in the list response
 async function hydrateICS(client, calendar, objs) {
   const out = [];
   for (const o of objs || []) {
     let ics = pickICS(o);
+    let hydrated = false;
     if (!ics) {
       try {
         const one = await client.fetchCalendarObject({
           calendar,
-          objectUrl: o.url || o.href || o.path, // cover different shapes
+          objectUrl: o.url || o.href || o.path,
         });
         ics = pickICS(one) || pickICS(one?.object) || null;
+        hydrated = !!ics;
       } catch {
-        // ignore; we'll skip this item if we still don't have ICS
+        // ignore
       }
     }
-    out.push({ ...o, __ics: ics || null });
+    out.push({ ...o, __ics: ics || null, __hydrated: hydrated });
   }
   return out;
 }
 
-// Count overlaps on a given local day + detect short recording (<4h) by SUMMARY text
 function analyzeForDate(objs, date) {
   const dayStart = new Date(date.getFullYear(), date.getMonth(), date.getDate());
   const dayEnd = new Date(dayStart); dayEnd.setDate(dayEnd.getDate() + 1);
 
   let count = 0;
   let shortRecording = false;
+  const summaries = [];
 
   for (const obj of objs || []) {
     const ics = obj.__ics || pickICS(obj);
@@ -80,21 +79,22 @@ function analyzeForDate(objs, date) {
         const e = ev.endDate.toJSDate();
         if (s < dayEnd && e > dayStart) {
           count++;
-          const summary = String(ev.summary || '');
+          const summary = String(ev.summary || '').slice(0, 140);
+          summaries.push(summary);
           const m = summary.match(/Recording Session\s*\((\d+)h\)/i);
           if (m) {
             const hrs = parseInt(m[1], 10);
             if (Number.isFinite(hrs) && hrs < 4) shortRecording = true;
           }
-          break; // count each object once per day
+          break;
         }
       }
     } catch {
-      // malformed ICS, skip
+      // skip malformed
     }
   }
 
-  return { count, shortRecording };
+  return { count, shortRecording, summaries };
 }
 
 export default async function handler(req, res) {
@@ -104,7 +104,7 @@ export default async function handler(req, res) {
   try {
     needEnv();
 
-    const { start, end } = req.query || {};
+    const { start, end, debug } = req.query || {};
     if (!start) return res.status(400).json({ error: 'start required' });
 
     const startD = dayjs(start).startOf('day');
@@ -122,34 +122,42 @@ export default async function handler(req, res) {
     });
 
     const calendars = await client.fetchCalendars();
+
+    const allCalNames = (calendars || []).map(c => ({
+      displayName: c.displayName,
+      url: c.url || c.href || c.path,
+      components: c.components,
+      accountType: c.accountType,
+    }));
+
     const findCal = (name) =>
       calendars.find(c => (c.displayName || '').toLowerCase() === String(name).toLowerCase());
 
     const calBookings = findCal(BOOKINGS_CAL_NAME);
     const calBlackouts = findCal(BLACKOUTS_CAL_NAME);
+
     if (!calBookings || !calBlackouts) {
       return res.status(500).json({
         error: 'Calendars not found',
-        names: calendars.map(c => c.displayName),
+        requested: { BOOKINGS_CAL_NAME, BLACKOUTS_CAL_NAME },
+        available: allCalNames,
       });
     }
 
-    // Use a buffer window and ask for expanded instances + object data.
-    // Not all servers honor these flags, so we still hydrate missing ICS below.
     const timeRange = {
       start: startD.subtract(1, 'day').toDate().toISOString(),
       end:   endD.add(2, 'day').toDate().toISOString(),
     };
 
-    let bookingObjs = [];
-    let blackoutObjs = [];
+    let bookingsRaw = [];
+    let blackoutsRaw = [];
     try {
       const [b, k] = await Promise.all([
         client.fetchCalendarObjects({
           calendar: calBookings,
           timeRange,
           expand: true,
-          objectData: true, // ask for ICS payload
+          objectData: true,
         }),
         client.fetchCalendarObjects({
           calendar: calBlackouts,
@@ -158,18 +166,23 @@ export default async function handler(req, res) {
           objectData: true,
         }),
       ]);
-      bookingObjs = await hydrateICS(client, calBookings, b || []);
-      blackoutObjs = await hydrateICS(client, calBlackouts, k || []);
+      bookingsRaw = await hydrateICS(client, calBookings, b || []);
+      blackoutsRaw = await hydrateICS(client, calBlackouts, k || []);
     } catch (e) {
       return res.status(500).json({ error: 'fetchCalendarObjects failed', detail: String(e?.message || e) });
     }
 
     const days = [];
+    const perDayDebug = [];
+
     for (let d = startD; d.isBefore(endD.add(1, 'day')); d = d.add(1, 'day')) {
       const js = d.toDate();
 
-      const { count: bookedCount, shortRecording } = analyzeForDate(bookingObjs, js);
-      const blackout = analyzeForDate(blackoutObjs, js).count > 0;
+      const A = analyzeForDate(bookingsRaw, js);
+      const B = analyzeForDate(blackoutsRaw, js);
+      const bookedCount = A.count;
+      const blackout = B.count > 0;
+      const shortRecording = A.shortRecording;
 
       days.push({
         date: d.format('YYYY-MM-DD'),
@@ -179,10 +192,46 @@ export default async function handler(req, res) {
         shortRecording,
         rule: 'available if NOT blackout AND bookedCount ≤ 1 AND NO recording session < 4h',
       });
+
+      if (debug) {
+        perDayDebug.push({
+          date: d.format('YYYY-MM-DD'),
+          bookingSummaries: A.summaries,
+          blackoutSummaries: B.summaries,
+        });
+      }
+    }
+
+    const payload = { days };
+    if (debug) {
+      payload.debug = {
+        requested: { BOOKINGS_CAL_NAME, BLACKOUTS_CAL_NAME },
+        resolvedCalendars: {
+          bookings: {
+            displayName: calBookings.displayName,
+            url: calBookings.url || calBookings.href || calBookings.path,
+          },
+          blackouts: {
+            displayName: calBlackouts.displayName,
+            url: calBlackouts.url || calBlackouts.href || calBlackouts.path,
+          },
+        },
+        counts: {
+          bookingsFetched: bookingsRaw.length,
+          blackoutsFetched: blackoutsRaw.length,
+          bookingsWithICS: bookingsRaw.filter(o => !!o.__ics).length,
+          blackoutsWithICS: blackoutsRaw.filter(o => !!o.__ics).length,
+          bookingsHydrated: bookingsRaw.filter(o => o.__hydrated).length,
+          blackoutsHydrated: blackoutsRaw.filter(o => o.__hydrated).length,
+        },
+        allCalendars: allCalNames,
+        perDay: perDayDebug,
+        timeRange,
+      };
     }
 
     res.setHeader('Cache-Control', 'no-store');
-    return res.status(200).json({ days });
+    return res.status(200).json(payload);
   } catch (e) {
     return res.status(500).json({ error: 'availability crashed', detail: String(e?.message || e) });
   }
