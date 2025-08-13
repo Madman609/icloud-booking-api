@@ -21,55 +21,76 @@ function needEnv() {
   }
 }
 
+// Pull ICS text out of various shapes tsdav/iCloud might return
 function pickICS(obj) {
-  // tsdav can surface ICS as `data`, `calendarData`, or nested in props
-  if (obj?.data) return obj.data;
-  if (obj?.calendarData) return obj.calendarData;
-  if (obj?.props) {
-    // common prop key names
-    if (obj.props['calendar-data']) return obj.props['calendar-data'];
-    if (obj.props['calendardata']) return obj.props['calendardata'];
+  if (!obj) return null;
+  if (typeof obj.data === 'string') return obj.data;
+  if (typeof obj.calendarData === 'string') return obj.calendarData;
+  if (obj.props) {
+    if (typeof obj.props['calendar-data'] === 'string') return obj.props['calendar-data'];
+    if (typeof obj.props['calendardata'] === 'string') return obj.props['calendardata'];
+  }
+  // Some providers put it under .objectData?.calendarData
+  if (obj.objectData && typeof obj.objectData.calendarData === 'string') {
+    return obj.objectData.calendarData;
   }
   return null;
 }
 
-/** Analyze overlap against a local day and detect short (<4h) recording sessions by SUMMARY text. */
-function analyzeEventsForDate(objects, date) {
+// Fetch ICS for any objects that didn't include it in the list response
+async function hydrateICS(client, calendar, objs) {
+  const out = [];
+  for (const o of objs || []) {
+    let ics = pickICS(o);
+    if (!ics) {
+      try {
+        const one = await client.fetchCalendarObject({
+          calendar,
+          objectUrl: o.url || o.href || o.path, // cover different shapes
+        });
+        ics = pickICS(one) || pickICS(one?.object) || null;
+      } catch {
+        // ignore; we'll skip this item if we still don't have ICS
+      }
+    }
+    out.push({ ...o, __ics: ics || null });
+  }
+  return out;
+}
+
+// Count overlaps on a given local day + detect short recording (<4h) by SUMMARY text
+function analyzeForDate(objs, date) {
   const dayStart = new Date(date.getFullYear(), date.getMonth(), date.getDate());
   const dayEnd = new Date(dayStart); dayEnd.setDate(dayEnd.getDate() + 1);
 
   let count = 0;
   let shortRecording = false;
 
-  for (const obj of objects || []) {
-    const ics = pickICS(obj);
+  for (const obj of objs || []) {
+    const ics = obj.__ics || pickICS(obj);
     if (!ics) continue;
 
     try {
       const jcal = ICAL.parse(ics);
       const comp = new ICAL.Component(jcal);
       const events = comp.getAllSubcomponents('vevent');
-
       for (const sub of events) {
         const ev = new ICAL.Event(sub);
         const s = ev.startDate.toJSDate();
         const e = ev.endDate.toJSDate();
-
-        // overlap with this local day?
         if (s < dayEnd && e > dayStart) {
           count++;
-
-          const summary = (ev.summary || '').toString();
+          const summary = String(ev.summary || '');
           const m = summary.match(/Recording Session\s*\((\d+)h\)/i);
           if (m) {
-            const hours = parseInt(m[1], 10);
-            if (Number.isFinite(hours) && hours < 4) shortRecording = true;
+            const hrs = parseInt(m[1], 10);
+            if (Number.isFinite(hrs) && hrs < 4) shortRecording = true;
           }
-          break; // count an obj at most once per day
+          break; // count each object once per day
         }
       }
     } catch {
-      // ignore malformed ICS
+      // malformed ICS, skip
     }
   }
 
@@ -107,26 +128,48 @@ export default async function handler(req, res) {
     const calBookings = findCal(BOOKINGS_CAL_NAME);
     const calBlackouts = findCal(BLACKOUTS_CAL_NAME);
     if (!calBookings || !calBlackouts) {
-      return res.status(500).json({ error: 'Calendars not found', names: calendars.map(c => c.displayName) });
+      return res.status(500).json({
+        error: 'Calendars not found',
+        names: calendars.map(c => c.displayName),
+      });
     }
 
-    // Buffer ±1 day to catch all-day/tz edges; and ask tsdav to expand instances
+    // Use a buffer window and ask for expanded instances + object data.
+    // Not all servers honor these flags, so we still hydrate missing ICS below.
     const timeRange = {
       start: startD.subtract(1, 'day').toDate().toISOString(),
       end:   endD.add(2, 'day').toDate().toISOString(),
     };
 
-    const [bookingObjs, blackoutObjs] = await Promise.all([
-      client.fetchCalendarObjects({ calendar: calBookings, timeRange, expand: true }),
-      client.fetchCalendarObjects({ calendar: calBlackouts, timeRange, expand: true }),
-    ]);
+    let bookingObjs = [];
+    let blackoutObjs = [];
+    try {
+      const [b, k] = await Promise.all([
+        client.fetchCalendarObjects({
+          calendar: calBookings,
+          timeRange,
+          expand: true,
+          objectData: true, // ask for ICS payload
+        }),
+        client.fetchCalendarObjects({
+          calendar: calBlackouts,
+          timeRange,
+          expand: true,
+          objectData: true,
+        }),
+      ]);
+      bookingObjs = await hydrateICS(client, calBookings, b || []);
+      blackoutObjs = await hydrateICS(client, calBlackouts, k || []);
+    } catch (e) {
+      return res.status(500).json({ error: 'fetchCalendarObjects failed', detail: String(e?.message || e) });
+    }
 
     const days = [];
     for (let d = startD; d.isBefore(endD.add(1, 'day')); d = d.add(1, 'day')) {
       const js = d.toDate();
 
-      const { count: bookedCount, shortRecording } = analyzeEventsForDate(bookingObjs, js);
-      const blackout = analyzeEventsForDate(blackoutObjs, js).count > 0;
+      const { count: bookedCount, shortRecording } = analyzeForDate(bookingObjs, js);
+      const blackout = analyzeForDate(blackoutObjs, js).count > 0;
 
       days.push({
         date: d.format('YYYY-MM-DD'),
@@ -134,13 +177,13 @@ export default async function handler(req, res) {
         blackout,
         bookedCount,
         shortRecording,
-        rule: 'available if NOT blackout AND bookedCount ≤ 1 AND NO recording session < 4h'
+        rule: 'available if NOT blackout AND bookedCount ≤ 1 AND NO recording session < 4h',
       });
     }
 
     res.setHeader('Cache-Control', 'no-store');
-    res.status(200).json({ days });
+    return res.status(200).json({ days });
   } catch (e) {
-    res.status(500).json({ error: 'availability crashed', detail: String(e?.message || e) });
+    return res.status(500).json({ error: 'availability crashed', detail: String(e?.message || e) });
   }
 }
