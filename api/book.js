@@ -12,14 +12,13 @@ const {
   ICLOUD_APP_PASSWORD,
   BOOKINGS_CAL_NAME = 'Bookings',
   BLACKOUTS_CAL_NAME = 'Blackouts',
-  CORS_ALLOW_ORIGIN = 'https://609music.com', // you can set this in Vercel; keep "*" while testing if needed
+  CORS_ALLOW_ORIGIN = 'https://609music.com', // set in Vercel; use "*" while testing if needed
 } = process.env;
 
 function setCORS(res) {
   res.setHeader('Access-Control-Allow-Origin', CORS_ALLOW_ORIGIN || '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  // browsers like to see this so responses can be cached safely by default
   res.setHeader('Cache-Control', 'no-store');
 }
 
