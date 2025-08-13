@@ -1,13 +1,13 @@
 {
-  "routes": [
+  "headers": [
     {
-      "src": "/api/(book|stripe-webhook)",
-      "methods": ["POST", "OPTIONS"],
-      "headers": {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type"
-      }
+      "source": "/api/(availability|checkout|book)",
+      "headers": [
+        { "key": "Access-Control-Allow-Origin", "value": "https://609music.com" },
+        { "key": "Access-Control-Allow-Methods", "value": "GET,POST,OPTIONS" },
+        { "key": "Access-Control-Allow-Headers", "value": "Content-Type,Authorization" },
+        { "key": "Access-Control-Max-Age", "value": "86400" }
+      ]
     }
   ]
 }
