@@ -1,41 +1,47 @@
-// api/book.js
-// NOTE: omit the old 'nodejs18.x' runtime. Either leave config out entirely,
-// or use { runtime: 'nodejs' } if you prefer explicit.
-export const config = { runtime: 'nodejs' };
+// api/book.js  (Vercel Node runtime, ESM)
 
+// 🔧 Fix: enable Day.js UTC plugin (needed for .utc())
 import dayjs from 'dayjs';
 import utc from 'dayjs/plugin/utc.js';
+dayjs.extend(utc);
+
 import { createDAVClient } from 'tsdav';
 
-dayjs.extend(utc);
+export const config = { runtime: 'nodejs' };
 
 const {
   ICLOUD_USERNAME,
   ICLOUD_APP_PASSWORD,
   BOOKINGS_CAL_NAME = 'Bookings',
   BLACKOUTS_CAL_NAME = 'Blackouts',
-  CORS_ALLOW_ORIGIN = 'https://609music.com',
 } = process.env;
 
-function setCORS(res) {
-  res.setHeader('Access-Control-Allow-Origin', CORS_ALLOW_ORIGIN || '*');
+function cors(res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   res.setHeader('Cache-Control', 'no-store');
 }
 
-function requireEnv() {
+const requireEnv = () => {
   if (!ICLOUD_USERNAME || !ICLOUD_APP_PASSWORD) {
     throw new Error('Missing ICLOUD_USERNAME or ICLOUD_APP_PASSWORD');
   }
-}
+};
 
-function buildICS({ uid, dateISO, summary, note }) {
-  const d0 = dayjs(dateISO);
-  const dtStart = d0.format('YYYYMMDD');
-  const dtEnd = d0.add(1, 'day').format('YYYYMMDD');
+// Build a simple all-day ICS event (local all-day date, UTC DTSTAMP)
+function buildICS({ uid, date, summary, note }) {
+  // `date` will be a Day.js object pointing to local midnight for that day
+  const dtStart = dayjs(date).format('YYYYMMDD');                 // all-day start (local)
+  const dtEnd   = dayjs(date).add(1, 'day').format('YYYYMMDD');   // all-day end (local next day)
+
+  // DTSTAMP must be in UTC per spec
   const stamp = dayjs().utc().format('YYYYMMDDTHHmmss[Z]');
-  const desc = note ? `DESCRIPTION:${String(note).replace(/\r?\n/g, '\\n')}` : '';
+
+  const desc = note
+    ? `DESCRIPTION:${String(note).replace(/\r?\n/g, '\\n')}`
+    : '';
+
   return [
     'BEGIN:VCALENDAR',
     'VERSION:2.0',
@@ -48,12 +54,12 @@ function buildICS({ uid, dateISO, summary, note }) {
     `SUMMARY:${summary}`,
     desc,
     'END:VEVENT',
-    'END:VCALENDAR',
+    'END:VCALENDAR'
   ].filter(Boolean).join('\r\n');
 }
 
 export default async function handler(req, res) {
-  setCORS(res);
+  cors(res);
   if (req.method === 'OPTIONS') return res.status(204).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
 
@@ -61,12 +67,13 @@ export default async function handler(req, res) {
     requireEnv();
 
     const { date, summary = '609 Booking', note = '' } = req.body || {};
-    if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-      return res.status(400).json({ error: 'date required (YYYY-MM-DD)' });
-    }
-    const d = dayjs(date);
+    if (!date) return res.status(400).json({ error: 'date required' });
+
+    // Parse the YYYY-MM-DD coming from the client as a local date (no time)
+    const d = dayjs(date, 'YYYY-MM-DD').startOf('day');
     if (!d.isValid()) return res.status(400).json({ error: 'invalid date' });
 
+    // Connect to iCloud CalDAV
     const client = await createDAVClient({
       serverUrl: 'https://caldav.icloud.com',
       credentials: { username: ICLOUD_USERNAME, password: ICLOUD_APP_PASSWORD },
@@ -85,13 +92,13 @@ export default async function handler(req, res) {
       return res.status(500).json({
         error: 'Calendars not found',
         names: calendars.map(c => c.displayName),
-        expected: { BOOKINGS_CAL_NAME, BLACKOUTS_CAL_NAME },
       });
     }
 
+    // Capacity / blackout check for that local day
     const timeRange = {
-      start: d.startOf('day').toDate().toISOString(),
-      end: d.startOf('day').add(1, 'day').toDate().toISOString(),
+      start: d.toDate().toISOString(),
+      end: d.add(1, 'day').toDate().toISOString(),
     };
 
     const [bookingObjs, blackoutObjs] = await Promise.all([
@@ -106,8 +113,9 @@ export default async function handler(req, res) {
       return res.status(409).json({ error: 'date not available', bookedCount, isBlackout });
     }
 
+    // Create all-day booking
     const uid = `${Date.now()}-${Math.random().toString(36).slice(2)}@609music`;
-    const ics = buildICS({ uid, dateISO: date, summary, note });
+    const ics = buildICS({ uid, date: d, summary, note });
 
     await client.createCalendarObject({
       calendar: calBookings,
@@ -115,7 +123,10 @@ export default async function handler(req, res) {
       iCalString: ics,
     });
 
-    return res.status(200).json({ ok: true, created: { date, uid } });
+    return res.status(200).json({
+      ok: true,
+      created: { date: d.format('YYYY-MM-DD'), uid }
+    });
   } catch (e) {
     console.error('[book] error:', e);
     return res.status(500).json({ error: 'book failed', detail: String(e?.message || e) });
