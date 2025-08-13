@@ -1,3 +1,4 @@
+// api/availability.js
 import dayjs from 'dayjs';
 import * as ICAL from 'ical.js';
 import { createDAVClient } from 'tsdav';
@@ -10,7 +11,7 @@ const {
 } = process.env;
 
 function cors(res) {
-  res.setHeader('Access-Control-Allow-Origin', '*'); // tighten later to https://609music.com
+  res.setHeader('Access-Control-Allow-Origin', '*'); // tighten to https://609music.com in prod
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 }
@@ -21,24 +22,49 @@ function needEnv() {
   }
 }
 
-function countEventsOnDate(objects, date) {
+/**
+ * Count events that overlap the given local day.
+ * Also detect "short recording" if any summary matches `Recording Session (Xh)` with X < 4.
+ */
+function analyzeEventsForDate(objects, date) {
   const dayStart = new Date(date.getFullYear(), date.getMonth(), date.getDate());
   const dayEnd = new Date(dayStart); dayEnd.setDate(dayEnd.getDate() + 1);
+
   let count = 0;
+  let shortRecording = false;
+
   for (const obj of objects || []) {
     try {
       const jcal = ICAL.parse(obj.data);
       const comp = new ICAL.Component(jcal);
       const events = comp.getAllSubcomponents('vevent');
+
       for (const sub of events) {
         const ev = new ICAL.Event(sub);
         const s = ev.startDate.toJSDate();
         const e = ev.endDate.toJSDate();
-        if (s < dayEnd && e > dayStart) { count++; break; }
+
+        // Overlap test
+        if (s < dayEnd && e > dayStart) {
+          count++;
+
+          // Short recording detection from SUMMARY
+          const summary = (ev.summary || '').toString();
+          const m = summary.match(/Recording Session\s*\((\d+)h\)/i);
+          if (m) {
+            const hours = parseInt(m[1], 10);
+            if (Number.isFinite(hours) && hours < 4) shortRecording = true;
+          }
+
+          break; // move to next object once we counted it
+        }
       }
-    } catch { /* ignore malformed items */ }
+    } catch {
+      // ignore malformed items
+    }
   }
-  return count;
+
+  return { count, shortRecording };
 }
 
 export default async function handler(req, res) {
@@ -57,7 +83,7 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: 'invalid dates' });
     }
 
-    // 1) Create client
+    // --- DAV client
     let client;
     try {
       client = await createDAVClient({
@@ -70,7 +96,7 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: 'createDAVClient failed', detail: String(e?.message || e) });
     }
 
-    // 2) Fetch calendars
+    // --- Calendars
     let calendars;
     try {
       calendars = await client.fetchCalendars();
@@ -93,12 +119,12 @@ export default async function handler(req, res) {
       });
     }
 
-    // 3) Time range must be ISO8601 strings for tsdav
-    const startISO = startD.toDate().toISOString();
-    const endISO = endD.add(1, 'day').toDate().toISOString();
+    // --- Time range (buffer by ±1 day to catch all-day/tz edge cases)
+    const startISO = startD.subtract(1, 'day').toDate().toISOString();
+    const endISO = endD.add(2, 'day').toDate().toISOString();
     const timeRange = { start: startISO, end: endISO };
 
-    // 4) Fetch objects within range
+    // --- Fetch objects in buffered range
     let bookingObjs = [], blackoutObjs = [];
     try {
       [bookingObjs, blackoutObjs] = await Promise.all([
@@ -109,24 +135,26 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: 'fetchCalendarObjects failed', detail: String(e?.message || e) });
     }
 
-    // 5) Build the per-day availability response
+    // --- Build per-day results
     const days = [];
     for (let d = startD; d.isBefore(endD.add(1, 'day')); d = d.add(1, 'day')) {
       const js = d.toDate();
-      const booked = countEventsOnDate(bookingObjs, js);
-      const blackout = countEventsOnDate(blackoutObjs, js) > 0;
+
+      const { count: bookedCount, shortRecording } = analyzeEventsForDate(bookingObjs, js);
+      const blackout = analyzeEventsForDate(blackoutObjs, js).count > 0;
+
       days.push({
         date: d.format('YYYY-MM-DD'),
-        available: !blackout && booked <= 1,
+        available: !blackout && bookedCount <= 1 && !shortRecording,
         blackout,
-        bookedCount: booked,
-        rule: 'available if not blacked out AND bookedCount ≤ 1',
+        bookedCount,
+        shortRecording,
+        rule: 'available if NOT blackout AND bookedCount ≤ 1 AND NO recording session < 4h'
       });
     }
 
     res.setHeader('Cache-Control', 'no-store');
     return res.status(200).json({ days });
-
   } catch (e) {
     return res.status(500).json({
       error: 'availability crashed',
