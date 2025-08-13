@@ -1,104 +1,146 @@
 // api/stripe-webhook.js
-export const config = { runtime: 'nodejs' };
+export const config = { runtime: 'edge' };
 
-import Stripe from 'stripe';
+const STRIPE_KEY = process.env.STRIPE_SECRET_KEY;
+const WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
 
-const STRIPE_KEY = process.env.STRIPE_SECRET_KEY;         // Test or Live (match your mode)
-const WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET; // From Stripe Dashboard > Developers > Webhooks
-const SELF_BASE_URL =
-  process.env.SELF_BASE_URL ||
-  (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'http://localhost:3000');
+// Verify Stripe signature for Edge (HMAC of raw body)
+async function verifyStripeSignature(request, secret) {
+  const sig = request.headers.get('stripe-signature');
+  if (!sig) throw new Error('Missing Stripe signature header');
 
-// Read raw body for signature verification
-async function readRawBody(req) {
-  const chunks = [];
-  for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  return Buffer.concat(chunks);
+  const params = Object.fromEntries(sig.split(',').map(kv => kv.split('=')));
+  const timestamp = params.t;
+  const signature = params.v1;
+  if (!timestamp || !signature) throw new Error('Invalid signature header');
+
+  // IMPORTANT: read raw body ONCE
+  const bodyText = await request.text();
+
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const mac = await crypto.subtle.sign(
+    'HMAC',
+    key,
+    new TextEncoder().encode(`${timestamp}.${bodyText}`)
+  );
+  const expected = Array.from(new Uint8Array(mac))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+
+  // Constant-time compare
+  if (expected.length !== signature.length) throw new Error('Bad signature length');
+  let mismatch = 0;
+  for (let i = 0; i < expected.length; i++) {
+    mismatch |= expected.charCodeAt(i) ^ signature.charCodeAt(i);
+  }
+  if (mismatch !== 0) throw new Error('Signature mismatch');
+
+  return JSON.parse(bodyText);
 }
 
-export default async function handler(req, res) {
+function json(status, data) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'content-type': 'application/json', 'cache-control': 'no-store' }
+  });
+}
+
+export default async function handler(req) {
   try {
     if (req.method !== 'POST') {
-      return res.status(405).send('Method Not Allowed');
+      return new Response('Method Not Allowed', { status: 405 });
     }
     if (!STRIPE_KEY || !WEBHOOK_SECRET) {
-      console.error('[webhook] missing STRIPE_SECRET_KEY or STRIPE_WEBHOOK_SECRET');
-      return res.status(500).send('Stripe not configured');
+      return json(500, { error: 'Stripe env missing', haveKey: !!STRIPE_KEY, haveWh: !!WEBHOOK_SECRET });
     }
-
-    const stripe = new Stripe(STRIPE_KEY, { apiVersion: '2024-06-20' });
-
-    // IMPORTANT: use raw body, not parsed JSON
-    const sig = req.headers['stripe-signature'];
-    const rawBody = await readRawBody(req);
 
     let event;
     try {
-      event = stripe.webhooks.constructEvent(rawBody, sig, WEBHOOK_SECRET);
-    } catch (err) {
-      console.error('[webhook] signature verification failed:', err?.message);
-      return res.status(400).send(`Webhook Error: ${err.message}`);
+      event = await verifyStripeSignature(req, WEBHOOK_SECRET);
+    } catch (e) {
+      return json(400, { error: 'signature verification failed', detail: String(e?.message || e) });
     }
 
-    // Log minimal event info for debugging
-    console.log('[webhook] event type:', event.type);
+    // Log the event type & id so we can correlate in Stripe dashboard
+    console.log('[WEBHOOK] type=', event?.type, 'id=', event?.id);
 
     if (event.type === 'checkout.session.completed') {
-      const sess = event.data.object || {};
+      const sess = event.data?.object || {};
       const meta = sess.metadata || {};
       const date = meta.date;
       const summary = meta.summary || 'Music Service Booking';
       const note = meta.note || '';
-      const apiBase = meta.apiBase || SELF_BASE_URL;
+      const apiBase = meta.apiBase;
 
-      console.log('[webhook] completed:', { date, summary, apiBase });
+      if (!apiBase || !date) {
+        console.warn('[WEBHOOK] missing apiBase or date', { apiBase, date });
+        return json(200, { status: 'ignored-missing-metadata' });
+      }
 
-      // Re-check capacity first (race-proof)
+      // Re-check capacity to avoid overbooking
+      let day;
       try {
         const r = await fetch(`${apiBase}/api/availability?start=${date}&end=${date}`, { cache: 'no-store' });
         const avail = await r.json();
-        const day = avail?.days?.[0];
-
-        if (!day || day.blackout || day.bookedCount >= 2) {
-          console.warn('[webhook] no capacity; optionally refund here. day=', day);
-          // Optional: if you want to auto-refund in this case:
-          // if (sess.payment_intent) {
-          //   await stripe.refunds.create({ payment_intent: sess.payment_intent });
-          // }
-          return res.status(200).json({ status: 'no capacity' });
-        }
+        day = avail?.days?.[0];
+        console.log('[WEBHOOK] availability for', date, '→', day);
       } catch (e) {
-        console.error('[webhook] availability check failed:', e?.message || e);
-        // Keep going (or choose to return a 500 to have Stripe retry)
+        console.error('[WEBHOOK] availability fetch failed', String(e));
+        // Still attempt booking; you can choose to bail here instead.
       }
 
-      // Create calendar event via your Node booking API
+      if (day?.blackout || (Number(day?.bookedCount) >= 2)) {
+        console.warn('[WEBHOOK] capacity hit, issuing refund');
+        if (sess.payment_intent) {
+          await fetch('https://api.stripe.com/v1/refunds', {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${STRIPE_KEY}`,
+              'Content-Type': 'application/x-www-form-urlencoded'
+            },
+            body: new URLSearchParams({ payment_intent: String(sess.payment_intent) })
+          });
+        }
+        return json(200, { status: 'refunded-no-capacity' });
+      }
+
+      // Create the calendar booking
       try {
         const make = await fetch(`${apiBase}/api/book`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ date, summary, note }),
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ date, summary, note })
         });
 
+        const text = await make.text();
+        let resp;
+        try { resp = JSON.parse(text); } catch { resp = { raw: text }; }
+
+        console.log('[WEBHOOK] /api/book →', make.status, resp);
+
         if (!make.ok) {
-          const text = await make.text();
-          console.error('[webhook] /api/book failed:', make.status, text);
-          return res.status(200).json({ status: 'paid but booking failed' });
+          // Optional: refund if booking fails
+          console.error('[WEBHOOK] booking failed');
+          return json(200, { status: 'paid-booking-failed', detail: resp });
         }
 
-        const created = await make.json();
-        console.log('[webhook] booked:', created);
-        return res.status(200).json({ status: 'booked' });
+        return json(200, { status: 'booked', detail: resp });
       } catch (e) {
-        console.error('[webhook] /api/book exception:', e?.message || e);
-        return res.status(200).json({ status: 'paid but booking failed' });
+        console.error('[WEBHOOK] book call error', String(e));
+        return json(200, { status: 'paid-book-call-error', detail: String(e) });
       }
     }
 
-    // Acknowledge other events
-    return res.status(200).json({ received: true });
+    // Ignore other event types
+    return json(200, { received: true, ignored: event?.type });
   } catch (err) {
-    console.error('[webhook] fatal error:', err?.message || err);
-    return res.status(500).send('Server error');
+    console.error('[WEBHOOK] fatal', String(err));
+    return json(400, { error: err?.message || 'Webhook error' });
   }
 }
