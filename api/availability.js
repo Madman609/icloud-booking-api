@@ -15,17 +15,25 @@ function cors(res) {
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 }
-
 function needEnv() {
   if (!ICLOUD_USERNAME || !ICLOUD_APP_PASSWORD) {
     throw new Error('Missing ICLOUD_USERNAME or ICLOUD_APP_PASSWORD');
   }
 }
 
-/**
- * Count events that overlap the given local day.
- * Also detect "short recording" if any summary matches `Recording Session (Xh)` with X < 4.
- */
+function pickICS(obj) {
+  // tsdav can surface ICS as `data`, `calendarData`, or nested in props
+  if (obj?.data) return obj.data;
+  if (obj?.calendarData) return obj.calendarData;
+  if (obj?.props) {
+    // common prop key names
+    if (obj.props['calendar-data']) return obj.props['calendar-data'];
+    if (obj.props['calendardata']) return obj.props['calendardata'];
+  }
+  return null;
+}
+
+/** Analyze overlap against a local day and detect short (<4h) recording sessions by SUMMARY text. */
 function analyzeEventsForDate(objects, date) {
   const dayStart = new Date(date.getFullYear(), date.getMonth(), date.getDate());
   const dayEnd = new Date(dayStart); dayEnd.setDate(dayEnd.getDate() + 1);
@@ -34,8 +42,11 @@ function analyzeEventsForDate(objects, date) {
   let shortRecording = false;
 
   for (const obj of objects || []) {
+    const ics = pickICS(obj);
+    if (!ics) continue;
+
     try {
-      const jcal = ICAL.parse(obj.data);
+      const jcal = ICAL.parse(ics);
       const comp = new ICAL.Component(jcal);
       const events = comp.getAllSubcomponents('vevent');
 
@@ -44,23 +55,21 @@ function analyzeEventsForDate(objects, date) {
         const s = ev.startDate.toJSDate();
         const e = ev.endDate.toJSDate();
 
-        // Overlap test
+        // overlap with this local day?
         if (s < dayEnd && e > dayStart) {
           count++;
 
-          // Short recording detection from SUMMARY
           const summary = (ev.summary || '').toString();
           const m = summary.match(/Recording Session\s*\((\d+)h\)/i);
           if (m) {
             const hours = parseInt(m[1], 10);
             if (Number.isFinite(hours) && hours < 4) shortRecording = true;
           }
-
-          break; // move to next object once we counted it
+          break; // count an obj at most once per day
         }
       }
     } catch {
-      // ignore malformed items
+      // ignore malformed ICS
     }
   }
 
@@ -83,59 +92,35 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: 'invalid dates' });
     }
 
-    // --- DAV client
-    let client;
-    try {
-      client = await createDAVClient({
-        serverUrl: 'https://caldav.icloud.com',
-        credentials: { username: ICLOUD_USERNAME, password: ICLOUD_APP_PASSWORD },
-        authMethod: 'Basic',
-        defaultAccountType: 'caldav',
-      });
-    } catch (e) {
-      return res.status(500).json({ error: 'createDAVClient failed', detail: String(e?.message || e) });
-    }
+    // DAV client
+    const client = await createDAVClient({
+      serverUrl: 'https://caldav.icloud.com',
+      credentials: { username: ICLOUD_USERNAME, password: ICLOUD_APP_PASSWORD },
+      authMethod: 'Basic',
+      defaultAccountType: 'caldav',
+    });
 
-    // --- Calendars
-    let calendars;
-    try {
-      calendars = await client.fetchCalendars();
-    } catch (e) {
-      return res.status(500).json({ error: 'fetchCalendars failed', detail: String(e?.message || e) });
-    }
-    if (!Array.isArray(calendars) || calendars.length === 0) {
-      return res.status(500).json({ error: 'No calendars found' });
-    }
-
+    const calendars = await client.fetchCalendars();
     const findCal = (name) =>
       calendars.find(c => (c.displayName || '').toLowerCase() === String(name).toLowerCase());
 
     const calBookings = findCal(BOOKINGS_CAL_NAME);
     const calBlackouts = findCal(BLACKOUTS_CAL_NAME);
     if (!calBookings || !calBlackouts) {
-      return res.status(500).json({
-        error: 'Calendars not found',
-        names: calendars.map(c => c.displayName)
-      });
+      return res.status(500).json({ error: 'Calendars not found', names: calendars.map(c => c.displayName) });
     }
 
-    // --- Time range (buffer by ±1 day to catch all-day/tz edge cases)
-    const startISO = startD.subtract(1, 'day').toDate().toISOString();
-    const endISO = endD.add(2, 'day').toDate().toISOString();
-    const timeRange = { start: startISO, end: endISO };
+    // Buffer ±1 day to catch all-day/tz edges; and ask tsdav to expand instances
+    const timeRange = {
+      start: startD.subtract(1, 'day').toDate().toISOString(),
+      end:   endD.add(2, 'day').toDate().toISOString(),
+    };
 
-    // --- Fetch objects in buffered range
-    let bookingObjs = [], blackoutObjs = [];
-    try {
-      [bookingObjs, blackoutObjs] = await Promise.all([
-        client.fetchCalendarObjects({ calendar: calBookings, timeRange }),
-        client.fetchCalendarObjects({ calendar: calBlackouts, timeRange }),
-      ]);
-    } catch (e) {
-      return res.status(500).json({ error: 'fetchCalendarObjects failed', detail: String(e?.message || e) });
-    }
+    const [bookingObjs, blackoutObjs] = await Promise.all([
+      client.fetchCalendarObjects({ calendar: calBookings, timeRange, expand: true }),
+      client.fetchCalendarObjects({ calendar: calBlackouts, timeRange, expand: true }),
+    ]);
 
-    // --- Build per-day results
     const days = [];
     for (let d = startD; d.isBefore(endD.add(1, 'day')); d = d.add(1, 'day')) {
       const js = d.toDate();
@@ -154,11 +139,8 @@ export default async function handler(req, res) {
     }
 
     res.setHeader('Cache-Control', 'no-store');
-    return res.status(200).json({ days });
+    res.status(200).json({ days });
   } catch (e) {
-    return res.status(500).json({
-      error: 'availability crashed',
-      detail: String(e?.message || e)
-    });
+    res.status(500).json({ error: 'availability crashed', detail: String(e?.message || e) });
   }
 }
