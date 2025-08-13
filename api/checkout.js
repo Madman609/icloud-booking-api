@@ -42,6 +42,13 @@ function corsPreflight(req) {
 
 // --- Config / constants ---
 const STRIPE_KEY = process.env.STRIPE_SECRET_KEY;
+
+// IMPORTANT: Use your public website for success/cancel redirects
+const SITE_BASE =
+  process.env.SITE_BASE ||
+  'https://609music.com';
+
+// Internal API base (this deployment) for server→server calls
 const API_BASE = process.env.VERCEL_URL
   ? `https://${process.env.VERCEL_URL}`
   : 'http://localhost:3000'; // local dev
@@ -58,28 +65,27 @@ export default async function handler(req) {
     const body = await req.json().catch(() => ({}));
     const { date, summary, note, total /*, payMethod*/ } = body || {};
 
+    // Basic validation
     if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
       return corsJSON(req, { error: 'Invalid or missing date' }, 400);
     }
-
     const amount = Math.round(Number(total || 0) * 100);
     if (!amount || amount < 100) {
       return corsJSON(req, { error: 'Invalid total amount' }, 400);
     }
 
-    // Re-check capacity (server-side)
+    // Re-check capacity (server-side) — trust the 'available' flag
     const availRes = await fetch(`${API_BASE}/api/availability?start=${date}&end=${date}`, { cache: 'no-store' });
     const avail = await availRes.json().catch(() => ({}));
     const day = avail?.days?.[0];
+    console.log('[checkout] recheck', { date, day });
 
-    // Helpful logging (visible in Vercel function logs)
-    console.log('[checkout] recheck', { date, avail });
-
-    if (!day || day.blackout || day.bookedCount >= 2) {
+    if (!day || day.available !== true) {
+      // include detail so you can see *why* in the browser
       return corsJSON(req, {
         error: 'Selected date is not available',
         detail: {
-          reason: !day ? 'no-day' : (day.blackout ? 'blackout' : (day.bookedCount >= 2 ? 'capacity' : 'unknown')),
+          reason: !day ? 'no-day' : (day.blackout ? 'blackout' : (typeof day.bookedCount === 'number' ? `capacity:${day.bookedCount}` : 'unknown')),
           day,
           checkedAt: new Date().toISOString()
         }
@@ -91,11 +97,11 @@ export default async function handler(req) {
     }
 
     // Stripe Checkout session
+    // Apple/Google Pay are covered by 'card'
     const methods = ['card', 'link', 'cashapp'];
 
-    // You can change these to your website if you prefer:
-    const successUrl = `${API_BASE}/success?date=${encodeURIComponent(date)}`;
-    const cancelUrl = `${API_BASE}/cancel?date=${encodeURIComponent(date)}`;
+    const successUrl = `${SITE_BASE}/pages/services.html?paid=1&date=${encodeURIComponent(date)}`;
+    const cancelUrl  = `${SITE_BASE}/pages/services.html?canceled=1&date=${encodeURIComponent(date)}`;
 
     const form = new URLSearchParams({
       mode: 'payment',
@@ -112,7 +118,7 @@ export default async function handler(req) {
       'metadata[date]': date,
       'metadata[summary]': summary || '',
       'metadata[note]': note || '',
-      'metadata[apiBase]': API_BASE,
+      'metadata[apiBase]': API_BASE, // your webhook will read this
       customer_creation: 'always',
       billing_address_collection: 'auto',
       allow_promotion_codes: 'false',
@@ -128,7 +134,6 @@ export default async function handler(req) {
     });
 
     const session = await createRes.json().catch(() => ({}));
-
     if (!createRes.ok || !session?.url) {
       return corsJSON(req, { error: session?.error?.message || 'Stripe session failed' }, 500);
     }
