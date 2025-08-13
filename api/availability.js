@@ -47,7 +47,7 @@ async function hydrateICS(client, calendar, objs) {
           objectUrl: o.url || o.href || o.path,
         });
         ics = pickICS(one) || pickICS(one?.object) || null;
-        hydrated = !!ics;
+        hydrated = !!(ics);
       } catch {
         // ignore
       }
@@ -57,6 +57,28 @@ async function hydrateICS(client, calendar, objs) {
   return out;
 }
 
+function normalizeRange(ev) {
+  // Convert ICAL.Time → JS Date; normalize all-day with zero/invalid DTEND to +1 day
+  const s = ev.startDate; // ICAL.Time
+  const e = ev.endDate;   // ICAL.Time or null
+  let sJS = s?.toJSDate?.() || null;
+  let eJS = e?.toJSDate?.() || null;
+
+  const isAllDay = !!s?.isDate;
+
+  if (isAllDay) {
+    if (!eJS || +eJS <= +sJS) {
+      // Treat as a single-day all-day event
+      const tmp = new Date(sJS.getFullYear(), sJS.getMonth(), sJS.getDate() + 1);
+      eJS = tmp;
+    } else {
+      // Some all-day events come through as VALUE=DATE with proper next-day DTEND — keep as is
+    }
+  }
+
+  return { sJS, eJS, isAllDay };
+}
+
 function analyzeForDate(objs, date) {
   const dayStart = new Date(date.getFullYear(), date.getMonth(), date.getDate());
   const dayEnd = new Date(dayStart); dayEnd.setDate(dayEnd.getDate() + 1);
@@ -64,6 +86,7 @@ function analyzeForDate(objs, date) {
   let count = 0;
   let shortRecording = false;
   const summaries = [];
+  const extracted = []; // debug: what we saw
 
   for (const obj of objs || []) {
     const ics = obj.__ics || pickICS(obj);
@@ -73,13 +96,23 @@ function analyzeForDate(objs, date) {
       const jcal = ICAL.parse(ics);
       const comp = new ICAL.Component(jcal);
       const events = comp.getAllSubcomponents('vevent');
+
       for (const sub of events) {
         const ev = new ICAL.Event(sub);
-        const s = ev.startDate.toJSDate();
-        const e = ev.endDate.toJSDate();
-        if (s < dayEnd && e > dayStart) {
+        const { sJS, eJS, isAllDay } = normalizeRange(ev);
+        if (!sJS || !eJS) continue;
+
+        const summary = String(ev.summary || '').slice(0, 160);
+        extracted.push({
+          summary,
+          isAllDay,
+          starts: sJS.toISOString(),
+          ends: eJS.toISOString()
+        });
+
+        // Overlap test
+        if (sJS < dayEnd && eJS > dayStart) {
           count++;
-          const summary = String(ev.summary || '').slice(0, 140);
           summaries.push(summary);
           const m = summary.match(/Recording Session\s*\((\d+)h\)/i);
           if (m) {
@@ -94,7 +127,7 @@ function analyzeForDate(objs, date) {
     }
   }
 
-  return { count, shortRecording, summaries };
+  return { count, shortRecording, summaries, extracted };
 }
 
 export default async function handler(req, res) {
@@ -122,7 +155,6 @@ export default async function handler(req, res) {
     });
 
     const calendars = await client.fetchCalendars();
-
     const allCalNames = (calendars || []).map(c => ({
       displayName: c.displayName,
       url: c.url || c.href || c.path,
@@ -180,6 +212,7 @@ export default async function handler(req, res) {
 
       const A = analyzeForDate(bookingsRaw, js);
       const B = analyzeForDate(blackoutsRaw, js);
+
       const bookedCount = A.count;
       const blackout = B.count > 0;
       const shortRecording = A.shortRecording;
@@ -198,6 +231,8 @@ export default async function handler(req, res) {
           date: d.format('YYYY-MM-DD'),
           bookingSummaries: A.summaries,
           blackoutSummaries: B.summaries,
+          bookingsExtracted: A.extracted,
+          blackoutsExtracted: B.extracted,
         });
       }
     }
