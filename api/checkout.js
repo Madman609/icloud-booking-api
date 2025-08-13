@@ -43,15 +43,17 @@ function corsPreflight(req) {
 // --- Config / constants ---
 const STRIPE_KEY = process.env.STRIPE_SECRET_KEY;
 
-// IMPORTANT: Use your public website for success/cancel redirects
-const SITE_BASE =
-  process.env.SITE_BASE ||
-  'https://609music.com';
+// Where to send users back after Stripe
+const SITE_BASE = process.env.SITE_BASE || 'https://609music.com';
 
-// Internal API base (this deployment) for server→server calls
-const API_BASE = process.env.VERCEL_URL
+// Internal API base (this deployment) for webhook metadata, etc.
+const INTERNAL_API_BASE = process.env.VERCEL_URL
   ? `https://${process.env.VERCEL_URL}`
   : 'http://localhost:3000'; // local dev
+
+// IMPORTANT: Use the same public base your browser uses for availability
+const PUBLIC_API_BASE =
+  process.env.PUBLIC_API_BASE || 'https://icloud-booking-api.vercel.app';
 
 export default async function handler(req) {
   // Handle CORS preflight
@@ -74,20 +76,46 @@ export default async function handler(req) {
       return corsJSON(req, { error: 'Invalid total amount' }, 400);
     }
 
-    // Re-check capacity (server-side) — trust the 'available' flag
-    const availRes = await fetch(`${API_BASE}/api/availability?start=${date}&end=${date}`, { cache: 'no-store' });
-    const avail = await availRes.json().catch(() => ({}));
-    const day = avail?.days?.[0];
-    console.log('[checkout] recheck', { date, day });
+    // Re-check capacity (server-side) — call the same public endpoint the browser hits
+    const availURL = `${PUBLIC_API_BASE}/api/availability?start=${date}&end=${date}`;
+    const availRes = await fetch(availURL, { cache: 'no-store' });
+    let avail, rawText = '';
+    try {
+      rawText = await availRes.text();
+      avail = JSON.parse(rawText);
+    } catch {
+      // leave avail undefined for diagnostics
+    }
 
-    if (!day || day.available !== true) {
-      // include detail so you can see *why* in the browser
+    const day = avail?.days?.[0];
+
+    // Helpful logging (visible in Vercel function logs)
+    console.log('[checkout] recheck', {
+      date,
+      status: availRes.status,
+      hasDays: Boolean(avail?.days?.length),
+    });
+
+    if (!availRes.ok) {
+      return corsJSON(req, {
+        error: 'Availability check failed upstream',
+        detail: { status: availRes.status, body: rawText?.slice(0, 400) || null, availURL }
+      }, 502);
+    }
+
+    // Trust the 'available' flag if present; otherwise fall back to blackout/capacity logic
+    const isAvailable =
+      day?.available === true ||
+      (!!day && day.blackout === false && Number(day.bookedCount || 0) <= 1);
+
+    if (!day || !isAvailable) {
       return corsJSON(req, {
         error: 'Selected date is not available',
         detail: {
-          reason: !day ? 'no-day' : (day.blackout ? 'blackout' : (typeof day.bookedCount === 'number' ? `capacity:${day.bookedCount}` : 'unknown')),
+          reason: !day ? 'no-day' : (day.blackout ? 'blackout' : `capacity:${day.bookedCount}`),
           day,
-          checkedAt: new Date().toISOString()
+          checkedAt: new Date().toISOString(),
+          availURL
         }
       }, 409);
     }
@@ -96,8 +124,7 @@ export default async function handler(req) {
       return corsJSON(req, { error: 'STRIPE_SECRET_KEY not configured' }, 500);
     }
 
-    // Stripe Checkout session
-    // Apple/Google Pay are covered by 'card'
+    // Stripe Checkout session (Apple/Google Pay ride with 'card')
     const methods = ['card', 'link', 'cashapp'];
 
     const successUrl = `${SITE_BASE}/pages/services.html?paid=1&date=${encodeURIComponent(date)}`;
@@ -118,7 +145,7 @@ export default async function handler(req) {
       'metadata[date]': date,
       'metadata[summary]': summary || '',
       'metadata[note]': note || '',
-      'metadata[apiBase]': API_BASE, // your webhook will read this
+      'metadata[apiBase]': INTERNAL_API_BASE, // webhook will call back here
       customer_creation: 'always',
       billing_address_collection: 'auto',
       allow_promotion_codes: 'false',
