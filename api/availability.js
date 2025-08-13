@@ -10,7 +10,7 @@ const {
   BLACKOUTS_CAL_NAME = 'Blackouts',
 } = process.env;
 
-/* ---- CORS ---- */
+/* ---------------- CORS ---------------- */
 function cors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*'); // tighten to https://609music.com later
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
@@ -23,64 +23,115 @@ function needEnv() {
   }
 }
 
-/* ---- Helpers ---- */
-function overlaps(s1, e1, s2, e2) {
-  return s1 < e2 && e1 > s2;
-}
+/* -------------- Time helpers -------------- */
+function overlaps(s1, e1, s2, e2) { return s1 < e2 && e1 > s2; }
+function startOfDay(js) { return new Date(js.getFullYear(), js.getMonth(), js.getDate()); }
+function endOfDay(js) { const d = startOfDay(js); d.setDate(d.getDate()+1); return d; }
 
+/* -------------- ICS extraction -------------- */
 function getICSFromObj(obj) {
-  // tsdav / servers can surface data under different keys — support them all
+  // tsdav variants / server variants
   return obj?.data || obj?.calendarData || obj?.iCalString || '';
 }
 
-function extractEventsFromICS(ics) {
+/* Primary parse via ical.js */
+function extractEvents_icaljs(ics) {
   try {
     const jcal = ICAL.parse(ics);
     const comp = new ICAL.Component(jcal);
-    return comp.getAllSubcomponents('vevent').map(v => new ICAL.Event(v));
+    return comp.getAllSubcomponents('vevent').map(v => new ICAL.Event(v))
+      .map(ev => {
+        const s = ev.startDate?.toJSDate?.();
+        const e = ev.endDate?.toJSDate?.();
+        if (!s || !e) return null;
+        const summary = String(ev.summary || '');
+        return { start: s, end: e, summary };
+      })
+      .filter(Boolean);
   } catch {
-    return [];
+    return null; // signal failure so we try regex fallback
   }
 }
 
+/* Fallback parse using regex (robust for VALUE=DATE all-day entries) */
+function extractEvents_regex(ics) {
+  const blocks = String(ics).split(/BEGIN:VEVENT/).slice(1).map(b => 'BEGIN:VEVENT' + b.split('END:VEVENT')[0] + 'END:VEVENT');
+  const evs = [];
+  for (const b of blocks) {
+    // DTSTART / DTEND (support VALUE=DATE and DATE-TIME)
+    const mStart = b.match(/DTSTART(?:;VALUE=DATE)?:(\d{8})(?:T(\d{6})Z)?/);
+    const mEnd   = b.match(/DTEND(?:;VALUE=DATE)?:(\d{8})(?:T(\d{6})Z)?/);
+    if (!mStart) continue;
+
+    let s, e;
+    if (mStart && mStart[2]) {
+      // date-time Z
+      const y = mStart[1].slice(0,4), mo = mStart[1].slice(4,6), d = mStart[1].slice(6,8);
+      const hh = mStart[2].slice(0,2), mi = mStart[2].slice(2,4), ss = mStart[2].slice(4,6);
+      s = new Date(`${y}-${mo}-${d}T${hh}:${mi}:${ss}Z`);
+    } else {
+      // all-day local
+      const y = mStart[1].slice(0,4), mo = mStart[1].slice(4,6), d = mStart[1].slice(6,8);
+      s = new Date(Number(y), Number(mo)-1, Number(d));
+    }
+
+    if (mEnd && mEnd[2]) {
+      const y = mEnd[1].slice(0,4), mo = mEnd[1].slice(4,6), d = mEnd[1].slice(6,8);
+      const hh = mEnd[2].slice(0,2), mi = mEnd[2].slice(2,4), ss = mEnd[2].slice(4,6);
+      e = new Date(`${y}-${mo}-${d}T${hh}:${mi}:${ss}Z`);
+    } else if (mEnd) {
+      // all-day DTEND is exclusive per RFC — treat as local midnight next day
+      const y = mEnd[1].slice(0,4), mo = mEnd[1].slice(4,6), d = mEnd[1].slice(6,8);
+      e = new Date(Number(y), Number(mo)-1, Number(d));
+    } else {
+      // No DTEND: assume same-day all-day
+      e = new Date(s);
+      e.setDate(e.getDate() + 1);
+    }
+
+    const sum = (b.match(/SUMMARY:(.*)/) || [,''])[1].trim();
+    evs.push({ start: s, end: e, summary: sum });
+  }
+  return evs;
+}
+
+/* Count events (with fallback) */
 function countEventsOnDate(objects, jsDate) {
-  const dayStart = new Date(jsDate.getFullYear(), jsDate.getMonth(), jsDate.getDate());
-  const dayEnd   = new Date(dayStart); dayEnd.setDate(dayEnd.getDate() + 1);
+  const dayStart = startOfDay(jsDate);
+  const dayEnd   = endOfDay(jsDate);
 
   let count = 0;
   for (const obj of objects || []) {
     const ics = getICSFromObj(obj);
     if (!ics) continue;
 
-    const events = extractEventsFromICS(ics);
+    let events = extractEvents_icaljs(ics);
+    if (!events) events = extractEvents_regex(ics);
+
     for (const ev of events) {
-      const s = ev.startDate?.toJSDate?.();
-      const e = ev.endDate?.toJSDate?.();
-      if (!s || !e) continue;
-      if (overlaps(s, e, dayStart, dayEnd)) { count++; break; }
+      if (!ev?.start || !ev?.end) continue;
+      if (overlaps(ev.start, ev.end, dayStart, dayEnd)) { count++; break; }
     }
   }
   return count;
 }
 
+/* Detect “Recording Session (Nh)” with N<4 on that date */
 function hasShortRecording(objects, jsDate) {
-  const dayStart = new Date(jsDate.getFullYear(), jsDate.getMonth(), jsDate.getDate());
-  const dayEnd   = new Date(dayStart); dayEnd.setDate(dayEnd.getDate() + 1);
+  const dayStart = startOfDay(jsDate);
+  const dayEnd   = endOfDay(jsDate);
 
   for (const obj of objects || []) {
     const ics = getICSFromObj(obj);
     if (!ics) continue;
 
-    const events = extractEventsFromICS(ics);
-    for (const ev of events) {
-      const s = ev.startDate?.toJSDate?.();
-      const e = ev.endDate?.toJSDate?.();
-      if (!s || !e) continue;
-      if (!overlaps(s, e, dayStart, dayEnd)) continue;
+    let events = extractEvents_icaljs(ics);
+    if (!events) events = extractEvents_regex(ics);
 
-      const summary = String(ev.summary || '');
-      // Match "Recording Session (Nh)"
-      const m = summary.match(/Recording\s+Session\s*\((\d+)\s*h\)/i);
+    for (const ev of events) {
+      if (!ev?.start || !ev?.end) continue;
+      if (!overlaps(ev.start, ev.end, dayStart, dayEnd)) continue;
+      const m = String(ev.summary || '').match(/Recording\s+Session\s*\((\d+)\s*h\)/i);
       if (m) {
         const hours = parseInt(m[1], 10);
         if (!Number.isNaN(hours) && hours < 4) return true;
@@ -90,7 +141,7 @@ function hasShortRecording(objects, jsDate) {
   return false;
 }
 
-/* ---- Handler ---- */
+/* ---------------- Handler ---------------- */
 export default async function handler(req, res) {
   cors(res);
   if (req.method === 'OPTIONS') return res.status(204).end();
@@ -107,7 +158,7 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: 'invalid dates' });
     }
 
-    // 1) CalDAV client
+    // 1) DAV client
     let client;
     try {
       client = await createDAVClient({
@@ -137,10 +188,7 @@ export default async function handler(req, res) {
     const calBookings = findCal(BOOKINGS_CAL_NAME);
     const calBlackouts = findCal(BLACKOUTS_CAL_NAME);
     if (!calBookings || !calBlackouts) {
-      return res.status(500).json({
-        error: 'Calendars not found',
-        names: calendars.map(c => c.displayName)
-      });
+      return res.status(500).json({ error: 'Calendars not found', names: calendars.map(c => c.displayName) });
     }
 
     // 3) Time range
@@ -148,7 +196,7 @@ export default async function handler(req, res) {
     const endISO   = endD.add(1, 'day').toDate().toISOString();
     const timeRange = { start: startISO, end: endISO };
 
-    // 4) Objects in range
+    // 4) Objects within range
     let bookingObjs = [], blackoutObjs = [];
     try {
       [bookingObjs, blackoutObjs] = await Promise.all([
@@ -159,16 +207,15 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: 'fetchCalendarObjects failed', detail: String(e?.message || e) });
     }
 
-    // 5) Per-day availability (no UI text here)
-    const endExclusive = endD.add(1, 'day'); // don’t mutate endD itself
+    // 5) Per-day result
+    const endExclusive = endD.add(1, 'day');
     const days = [];
     for (let d = startD; d.isBefore(endExclusive); d = d.add(1, 'day')) {
       const js = d.toDate();
       const bookedCount    = countEventsOnDate(bookingObjs, js);
       const blackout       = countEventsOnDate(blackoutObjs, js) > 0;
       const shortRecording = hasShortRecording(bookingObjs, js);
-
-      const available = !blackout && bookedCount <= 1 && !shortRecording;
+      const available      = !blackout && bookedCount <= 1 && !shortRecording;
 
       days.push({
         date: d.format('YYYY-MM-DD'),
@@ -182,7 +229,6 @@ export default async function handler(req, res) {
 
     res.setHeader('Cache-Control', 'no-store');
 
-    // Optional debug to help verify what the server saw
     if (String(debug).toLowerCase() === 'true') {
       const perDay = [];
       for (const day of days) {
@@ -191,39 +237,32 @@ export default async function handler(req, res) {
         const blackoutsExtracted = [];
 
         for (const obj of bookingObjs || []) {
-          const ics = getICSFromObj(obj);
-          if (!ics) continue;
-          const events = extractEventsFromICS(ics);
+          const ics = getICSFromObj(obj); if (!ics) continue;
+          let events = extractEvents_icaljs(ics); if (!events) events = extractEvents_regex(ics);
           for (const ev of events) {
-            const s = ev.startDate?.toJSDate?.();
-            const e = ev.endDate?.toJSDate?.();
-            if (!s || !e) continue;
-            if (overlaps(s, e, js, new Date(js.getTime() + 86400000))) {
+            if (overlaps(ev.start, ev.end, startOfDay(js), endOfDay(js))) {
               bookingsExtracted.push({
                 summary: String(ev.summary || ''),
-                start: s.toISOString(),
-                end: e.toISOString()
+                start: ev.start.toISOString(),
+                end: ev.end.toISOString()
               });
             }
           }
         }
         for (const obj of blackoutObjs || []) {
-          const ics = getICSFromObj(obj);
-          if (!ics) continue;
-          const events = extractEventsFromICS(ics);
+          const ics = getICSFromObj(obj); if (!ics) continue;
+          let events = extractEvents_icaljs(ics); if (!events) events = extractEvents_regex(ics);
           for (const ev of events) {
-            const s = ev.startDate?.toJSDate?.();
-            const e = ev.endDate?.toJSDate?.();
-            if (!s || !e) continue;
-            if (overlaps(s, e, js, new Date(js.getTime() + 86400000))) {
+            if (overlaps(ev.start, ev.end, startOfDay(js), endOfDay(js))) {
               blackoutsExtracted.push({
                 summary: String(ev.summary || ''),
-                start: s.toISOString(),
-                end: e.toISOString()
+                start: ev.start.toISOString(),
+                end: ev.end.toISOString()
               });
             }
           }
         }
+
         perDay.push({ date: day.date, bookingsExtracted, blackoutsExtracted });
       }
 
@@ -235,10 +274,7 @@ export default async function handler(req, res) {
             bookings: { displayName: calBookings.displayName, url: calBookings.url },
             blackouts: { displayName: calBlackouts.displayName, url: calBlackouts.url }
           },
-          counts: {
-            bookingsFetched: bookingObjs?.length || 0,
-            blackoutsFetched: blackoutObjs?.length || 0
-          },
+          counts: { bookingsFetched: bookingObjs?.length || 0, blackoutsFetched: blackoutObjs?.length || 0 },
           perDay,
           timeRange: { start: startISO, end: endISO }
         }
@@ -247,9 +283,6 @@ export default async function handler(req, res) {
 
     return res.status(200).json({ days });
   } catch (e) {
-    return res.status(500).json({
-      error: 'availability crashed',
-      detail: String(e?.message || e)
-    });
+    return res.status(500).json({ error: 'availability crashed', detail: String(e?.message || e) });
   }
 }
