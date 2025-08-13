@@ -4,7 +4,10 @@
 export const config = { runtime: 'nodejs' };
 
 import dayjs from 'dayjs';
+import utc from 'dayjs/plugin/utc.js';
 import { createDAVClient } from 'tsdav';
+
+dayjs.extend(utc);
 
 const {
   ICLOUD_USERNAME,
