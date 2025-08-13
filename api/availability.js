@@ -1,6 +1,8 @@
 // api/availability.js
 import dayjs from 'dayjs';
-import * as ICAL from 'ical.js';
+import ICAL from 'ical.js';
+// or:
+// import { parse as icalParse, Component as ICALComponent, Event as ICALEvent } from 'ical.js';
 import { createDAVClient } from 'tsdav';
 
 const {
