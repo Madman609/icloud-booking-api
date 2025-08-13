@@ -2,7 +2,7 @@
 // Node runtime (required for tsdav). Creates an all-day event in iCloud "Bookings" calendar
 // after checking "Blackouts" and ensuring <= 1 existing booking for that date.
 
-export const config = { runtime: 'nodejs18.x' };
+export const config = { runtime: 'nodejs' };
 
 import dayjs from 'dayjs';
 import { createDAVClient } from 'tsdav';
