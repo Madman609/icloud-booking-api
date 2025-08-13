@@ -1,50 +1,47 @@
 // api/stripe-webhook.js
-export const config = { runtime: 'edge' };
+export const config = { runtime: 'nodejs' };
 
-const STRIPE_KEY = process.env.STRIPE_SECRET_KEY;
-const WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
+import Stripe from 'stripe';
 
-// Quick HMAC verification for Edge (Stripe official library isn’t Edge-native).
-// NOTE: For production robustness consider moving this route to Node runtime
-// with the official Stripe SDK. This minimal Edge version verifies signatures.
-async function verifyStripeSignature(request, secret) {
-  const sig = request.headers.get('stripe-signature');
-  if (!sig) throw new Error('Missing Stripe signature');
+const STRIPE_KEY = process.env.STRIPE_SECRET_KEY;         // Test or Live (match your mode)
+const WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET; // From Stripe Dashboard > Developers > Webhooks
+const SELF_BASE_URL =
+  process.env.SELF_BASE_URL ||
+  (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'http://localhost:3000');
 
-  // Stripe’s signature header looks like: t=timestamp,v1=signature,...
-  const params = Object.fromEntries(sig.split(',').map(kv => kv.split('=')));
-  const timestamp = params.t;
-  const signature = params.v1;
-  if (!timestamp || !signature) throw new Error('Invalid signature header');
-
-  const body = await request.text();
-  const encoder = new TextEncoder();
-  const key = await crypto.subtle.importKey(
-    'raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
-  );
-  const mac = await crypto.subtle.sign('HMAC', key, encoder.encode(`${timestamp}.${body}`));
-  const expected = Array.from(new Uint8Array(mac)).map(b => b.toString(16).padStart(2, '0')).join('');
-
-  // Compare in constant time
-  if (expected.length !== signature.length) throw new Error('Bad signature');
-  let ok = 0;
-  for (let i = 0; i < expected.length; i++) ok |= expected.charCodeAt(i) ^ signature.charCodeAt(i);
-  if (ok !== 0) throw new Error('Signature mismatch');
-
-  return JSON.parse(body);
+// Read raw body for signature verification
+async function readRawBody(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  return Buffer.concat(chunks);
 }
 
-export default async function handler(req) {
+export default async function handler(req, res) {
   try {
     if (req.method !== 'POST') {
-      return new Response('Method Not Allowed', { status: 405 });
+      return res.status(405).send('Method Not Allowed');
     }
     if (!STRIPE_KEY || !WEBHOOK_SECRET) {
-      return new Response('Stripe not configured', { status: 500 });
+      console.error('[webhook] missing STRIPE_SECRET_KEY or STRIPE_WEBHOOK_SECRET');
+      return res.status(500).send('Stripe not configured');
     }
 
-    // Verify signature & parse event
-    const event = await verifyStripeSignature(req, WEBHOOK_SECRET);
+    const stripe = new Stripe(STRIPE_KEY, { apiVersion: '2024-06-20' });
+
+    // IMPORTANT: use raw body, not parsed JSON
+    const sig = req.headers['stripe-signature'];
+    const rawBody = await readRawBody(req);
+
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(rawBody, sig, WEBHOOK_SECRET);
+    } catch (err) {
+      console.error('[webhook] signature verification failed:', err?.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    // Log minimal event info for debugging
+    console.log('[webhook] event type:', event.type);
 
     if (event.type === 'checkout.session.completed') {
       const sess = event.data.object || {};
@@ -52,45 +49,56 @@ export default async function handler(req) {
       const date = meta.date;
       const summary = meta.summary || 'Music Service Booking';
       const note = meta.note || '';
-      const apiBase = meta.apiBase;
+      const apiBase = meta.apiBase || SELF_BASE_URL;
 
-      // Recheck availability (race-proof)
-      const r = await fetch(`${apiBase}/api/availability?start=${date}&end=${date}`, { cache: 'no-store' });
-      const avail = await r.json();
-      const day = avail?.days?.[0];
-      if (!day || day.blackout || day.bookedCount >= 2) {
-        // Optional: auto-refund (requires a Payment Intent)
-        if (sess.payment_intent) {
-          await fetch(`https://api.stripe.com/v1/refunds`, {
-            method: 'POST',
-            headers: {
-              Authorization: `Bearer ${STRIPE_KEY}`,
-              'Content-Type': 'application/x-www-form-urlencoded'
-            },
-            body: new URLSearchParams({ payment_intent: sess.payment_intent })
-          });
+      console.log('[webhook] completed:', { date, summary, apiBase });
+
+      // Re-check capacity first (race-proof)
+      try {
+        const r = await fetch(`${apiBase}/api/availability?start=${date}&end=${date}`, { cache: 'no-store' });
+        const avail = await r.json();
+        const day = avail?.days?.[0];
+
+        if (!day || day.blackout || day.bookedCount >= 2) {
+          console.warn('[webhook] no capacity; optionally refund here. day=', day);
+          // Optional: if you want to auto-refund in this case:
+          // if (sess.payment_intent) {
+          //   await stripe.refunds.create({ payment_intent: sess.payment_intent });
+          // }
+          return res.status(200).json({ status: 'no capacity' });
         }
-        return new Response(JSON.stringify({ status: 'refunded (no capacity)' }), { status: 200 });
+      } catch (e) {
+        console.error('[webhook] availability check failed:', e?.message || e);
+        // Keep going (or choose to return a 500 to have Stripe retry)
       }
 
-      // Create the calendar event via your existing /api/book endpoint
-      const make = await fetch(`${apiBase}/api/book`, {
-        method: 'POST',
-        headers: { 'Content-Type':'application/json' },
-        body: JSON.stringify({ date, summary, note })
-      });
+      // Create calendar event via your Node booking API
+      try {
+        const make = await fetch(`${apiBase}/api/book`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ date, summary, note }),
+        });
 
-      if (!make.ok) {
-        // If calendar fails, you may choose to refund here too
-        return new Response(JSON.stringify({ status: 'paid but booking failed' }), { status: 200 });
+        if (!make.ok) {
+          const text = await make.text();
+          console.error('[webhook] /api/book failed:', make.status, text);
+          return res.status(200).json({ status: 'paid but booking failed' });
+        }
+
+        const created = await make.json();
+        console.log('[webhook] booked:', created);
+        return res.status(200).json({ status: 'booked' });
+      } catch (e) {
+        console.error('[webhook] /api/book exception:', e?.message || e);
+        return res.status(200).json({ status: 'paid but booking failed' });
       }
-
-      return new Response(JSON.stringify({ status: 'booked' }), { status: 200 });
     }
 
-    // Ignore other events
-    return new Response(JSON.stringify({ received: true }), { status: 200 });
+    // Acknowledge other events
+    return res.status(200).json({ received: true });
   } catch (err) {
-    return new Response(JSON.stringify({ error: err?.message || 'Webhook error' }), { status: 400 });
+    console.error('[webhook] fatal error:', err?.message || err);
+    return res.status(500).send('Server error');
   }
 }
