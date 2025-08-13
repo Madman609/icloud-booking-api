@@ -1,7 +1,4 @@
 // api/book.js
-// Node runtime (required for tsdav). Creates an all-day event in iCloud "Bookings" calendar
-// after checking "Blackouts" and ensuring <= 1 existing booking for that date.
-
 export const config = { runtime: 'nodejs' };
 
 import dayjs from 'dayjs';
@@ -12,7 +9,7 @@ const {
   ICLOUD_APP_PASSWORD,
   BOOKINGS_CAL_NAME = 'Bookings',
   BLACKOUTS_CAL_NAME = 'Blackouts',
-  CORS_ALLOW_ORIGIN = 'https://609music.com', // set in Vercel; use "*" while testing if needed
+  CORS_ALLOW_ORIGIN = 'https://609music.com',
 } = process.env;
 
 function setCORS(res) {
@@ -29,9 +26,9 @@ function requireEnv() {
 }
 
 function buildICS({ uid, dateISO, summary, note }) {
-  const d0 = dayjs(dateISO);                          // local date (start-of-day)
+  const d0 = dayjs(dateISO);
   const dtStart = d0.format('YYYYMMDD');
-  const dtEnd = d0.add(1, 'day').format('YYYYMMDD');  // all-day event ends next day
+  const dtEnd = d0.add(1, 'day').format('YYYYMMDD');
   const stamp = dayjs().utc().format('YYYYMMDDTHHmmss[Z]');
   const desc = note ? `DESCRIPTION:${String(note).replace(/\r?\n/g, '\\n')}` : '';
   return [
@@ -59,14 +56,12 @@ export default async function handler(req, res) {
     requireEnv();
 
     const { date, summary = '609 Booking', note = '' } = req.body || {};
-    // Expect "YYYY-MM-DD"
     if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
       return res.status(400).json({ error: 'date required (YYYY-MM-DD)' });
     }
     const d = dayjs(date);
     if (!d.isValid()) return res.status(400).json({ error: 'invalid date' });
 
-    // Connect to iCloud via CalDAV
     const client = await createDAVClient({
       serverUrl: 'https://caldav.icloud.com',
       credentials: { username: ICLOUD_USERNAME, password: ICLOUD_APP_PASSWORD },
@@ -89,7 +84,6 @@ export default async function handler(req, res) {
       });
     }
 
-    // Capacity / blackout check for the selected day (local midnight → +1 day)
     const timeRange = {
       start: d.startOf('day').toDate().toISOString(),
       end: d.startOf('day').add(1, 'day').toDate().toISOString(),
@@ -103,12 +97,10 @@ export default async function handler(req, res) {
     const bookedCount = bookingObjs?.length || 0;
     const isBlackout = (blackoutObjs?.length || 0) > 0;
 
-    // Rule: available if not blacked out AND bookedCount ≤ 1
     if (isBlackout || bookedCount >= 2) {
       return res.status(409).json({ error: 'date not available', bookedCount, isBlackout });
     }
 
-    // Create all-day booking
     const uid = `${Date.now()}-${Math.random().toString(36).slice(2)}@609music`;
     const ics = buildICS({ uid, dateISO: date, summary, note });
 
@@ -118,10 +110,7 @@ export default async function handler(req, res) {
       iCalString: ics,
     });
 
-    return res.status(200).json({
-      ok: true,
-      created: { date, uid },
-    });
+    return res.status(200).json({ ok: true, created: { date, uid } });
   } catch (e) {
     console.error('[book] error:', e);
     return res.status(500).json({ error: 'book failed', detail: String(e?.message || e) });
