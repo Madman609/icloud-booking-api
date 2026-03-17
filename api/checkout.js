@@ -127,8 +127,8 @@ export default async function handler(req) {
     // Stripe Checkout session (Apple/Google Pay ride with 'card')
     const methods = ['card', 'link', 'cashapp'];
 
-    const successUrl = `${SITE_BASE}/pages/services.html?paid=1&date=${encodeURIComponent(date)}`;
-    const cancelUrl  = `${SITE_BASE}/pages/services.html?canceled=1&date=${encodeURIComponent(date)}`;
+    const successUrl = `${SITE_BASE}/services.html?paid=1&date=${encodeURIComponent(date)}`;
+    const cancelUrl  = `${SITE_BASE}/services.html?canceled=1&date=${encodeURIComponent(date)}`;
 
     const form = new URLSearchParams({
       mode: 'payment',
